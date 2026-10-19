@@ -4,9 +4,7 @@ import { logger } from "./logger";
 import { pool } from "./db";
 import { config } from "../config";
 import { ApiError } from "../middleware/errors";
-import dotenv from "dotenv";
-
-dotenv.config();
+import { linkProjectToApplication } from "./creatorOnboarding";
 
 export type VaultEventType =
   "deposit" | "withdraw" | "WithdrawQueued" | "WithdrawClaimed" | "YieldClaimed";
@@ -95,7 +93,7 @@ function findFirstMatchingValue(
   return undefined;
 }
 
-function extractSourceAccount(tx: any): string | null {
+function extractSourceAccount(tx: unknown): string | null {
   const candidate = findFirstMatchingValue(tx, ["source", "sourceAccount", "account", "from"]);
   if (typeof candidate === "string" && candidate.trim()) {
     return candidate.trim();
@@ -180,7 +178,7 @@ function parseVaultEvent(
   };
 }
 
-function extractVaultEvent(tx: any): Partial<VaultEvent> | null {
+function extractVaultEvent(tx: unknown): Partial<VaultEvent> | null {
   const sourceAccount = extractSourceAccount(tx);
   const candidates: unknown[] = [];
 
@@ -198,13 +196,19 @@ function extractVaultEvent(tx: any): Partial<VaultEvent> | null {
     }
   }
 
-  const meta = tx?.resultMetaXdr;
+  interface TxWithResultMetaXdr {
+    resultMetaXdr?: unknown;
+  }
+  const meta = (tx as TxWithResultMetaXdr)?.resultMetaXdr;
   if (meta && typeof meta === "object") {
-    const v1 = (meta as any).v1;
+    interface MetaWithV1 {
+      v1?: () => { events?: unknown[] };
+    }
+    const v1 = (meta as MetaWithV1).v1;
     if (typeof v1 === "function") {
       const result = v1.call(meta);
       if (result && typeof result === "object") {
-        const nested = (result as any).events;
+        const nested = result.events;
         if (Array.isArray(nested)) {
           for (const item of nested) {
             const parsed = parseVaultEvent(item, sourceAccount);
@@ -222,8 +226,11 @@ function extractVaultEvent(tx: any): Partial<VaultEvent> | null {
     }
   }
 
-  if (Array.isArray(tx?.diagnosticEvents)) {
-    for (const item of tx.diagnosticEvents) {
+  interface TxWithDiagnosticEvents {
+    diagnosticEvents?: unknown[];
+  }
+  if (Array.isArray((tx as TxWithDiagnosticEvents)?.diagnosticEvents)) {
+    for (const item of (tx as TxWithDiagnosticEvents).diagnosticEvents!) {
       const parsed = parseVaultEvent(item, sourceAccount);
       if (parsed) {
         return {
@@ -236,6 +243,48 @@ function extractVaultEvent(tx: any): Partial<VaultEvent> | null {
     }
   }
 
+  return null;
+}
+
+interface IndexedProjectCreated {
+  projectId: number;
+  metadataHash: string;
+}
+
+/**
+ * Extract a `ProjectCreated` contract event (#771) emitted by `create_project`.
+ * Linking is by `metadata_hash`, which uniquely identifies the approved
+ * application whose metadata was pinned. Returns null for non-matching txs.
+ */
+function extractProjectCreatedEvent(tx: unknown): IndexedProjectCreated | null {
+  const candidates: unknown[] = [];
+  flattenEventCandidates(tx, candidates);
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const name = findFirstMatchingValue(candidate, [
+      "type",
+      "eventType",
+      "kind",
+      "action",
+      "method",
+      "name",
+    ]);
+    const normalized = typeof name === "string" ? name.replace(/[^a-z]/gi, "").toLowerCase() : "";
+    if (!normalized.includes("projectcreated")) continue;
+
+    const projectId = toNumber(
+      findFirstMatchingValue(candidate, ["project_id", "projectId", "created_project_id"]),
+    );
+    const hashValue = findFirstMatchingValue(candidate, [
+      "metadata_hash",
+      "metadataHash",
+      "meta_hash",
+    ]);
+    const metadataHash = typeof hashValue === "string" ? hashValue : null;
+    if (projectId === null || !metadataHash) continue;
+    return { projectId, metadataHash };
+  }
   return null;
 }
 
@@ -399,10 +448,20 @@ export class EventIndexer {
         // ledger sequence number (e.g. "12345678") is not a valid hash and will
         // never match a real transaction, so the old loop silently discovered
         // nothing. getEvents() is the correct RPC surface for this use-case.
-        const eventsResponse = await (client as any).getEvents({
+        interface GetEventsResponse {
+          events?: unknown[];
+        }
+        const eventsResponse = (await (
+          client as unknown as {
+            getEvents: (params: {
+              startLedger: number;
+              filters: Array<{ type: string }>;
+            }) => Promise<GetEventsResponse>;
+          }
+        ).getEvents({
           startLedger,
           filters: [{ type: "contract" }],
-        });
+        })) as GetEventsResponse;
 
         const rawEvents: unknown[] = Array.isArray(eventsResponse?.events)
           ? eventsResponse.events
@@ -454,6 +513,27 @@ export class EventIndexer {
     try {
       const tx = await client.getTransaction(txHash);
       if (!tx) return;
+
+      // Creator-onboarding: a confirmed create_project links the on-chain
+      // project id back to the approved application (#771).
+      const projectCreated = extractProjectCreatedEvent(tx);
+      if (projectCreated) {
+        try {
+          const linked = linkProjectToApplication({
+            metadataHash: projectCreated.metadataHash,
+            projectId: projectCreated.projectId,
+            txHash,
+            ledger,
+          });
+          if (linked) {
+            logger.info(
+              `[indexer] linked ProjectCreated ${projectCreated.projectId} to application ${linked.id}`,
+            );
+          }
+        } catch (err) {
+          logger.debug("[indexer] project link failed", logger.formatError(err));
+        }
+      }
 
       const parsed = extractVaultEvent(tx);
       if (!parsed) return;
